@@ -199,7 +199,90 @@ must-gather-root/
 
 ---
 
-### 3. `rbd_cleanup.py` — Orphan Cleanup
+### 3. Manual Data Collection (When Must-Gather Fails)
+
+When the ODF must-gather fails to collect complete RBD data, you can manually capture the required information using these scripts.
+
+#### 3a. `capture_rbd_data.sh` — Manual Data Capture
+
+A bash script that collects RBD pool data directly from a live cluster and produces files compatible with `rbd_tree_builder_manualData.py`.
+
+**What It Captures:**
+1. **Trash list** — All images in RBD trash (`rbd trash ls`)
+2. **Image info + snapshots** — For both active and trashed images:
+   - Active images: `rbd info`, `rbd snap ls`
+   - Trashed images: `rbd info --image-id`, `rbd snap ls --image-id`
+3. **PersistentVolume list** — All PVs from Kubernetes API (`kubectl get pv -o json`)
+
+**Usage:**
+
+```bash
+# Run from a system with Ceph and kubectl access
+bash capture_rbd_data.sh [POOL_NAME] [OUTPUT_DIR]
+
+# Defaults:
+#   POOL_NAME  = ocs-storagecluster-cephblockpool
+#   OUTPUT_DIR = rbd_capture
+
+# Example: Capture specific pool
+bash capture_rbd_data.sh ocs-storagecluster-cephblockpool my_capture
+
+# On ODF clusters, run inside the toolbox pod:
+oc rsh -n openshift-storage $(oc get pod -n openshift-storage -l app=rook-ceph-tools -o name)
+bash capture_rbd_data.sh
+```
+
+**Output Files:**
+```
+rbd_capture/
+├── trash_list.json        # JSON array of trashed images
+├── images_and_snaps.txt   # Delimited text: image info + snapshots
+└── pv_list.json           # Kubernetes PV list in JSON
+```
+
+**Important Note on Trash Images:**
+
+The current script captures `rbd info` and `rbd snap ls` for trash images using `--image-id`, but does **not** capture children information. To get complete parent-child relationships for trashed images, you need to also run:
+
+```bash
+# For each trashed image snapshot, capture children:
+rbd children -p <pool> --image-id <image-id> --snap-id <snap-id>
+```
+
+This limitation means that clone relationships involving trashed parent images may not be fully represented in the tree. Future versions of the script should include this data.
+
+#### 3b. `rbd_tree_builder_manualData.py` — Build Tree from Manual Capture
+
+Processes the files created by `capture_rbd_data.sh` and builds the same nested JSON tree structure.
+
+**Usage:**
+
+```bash
+# Basic usage
+python3 rbd_tree_builder_manualData.py rbd_capture/
+
+# Specify output file
+python3 rbd_tree_builder_manualData.py rbd_capture/ --output tree.json
+```
+
+**Output Structure:**
+
+Identical to `rbd_tree_builder_mustGather.py` — includes `orphaned_pv` and `volumes` arrays.
+
+**Prerequisites:**
+- Python 3.6+
+- Capture files from `capture_rbd_data.sh`
+
+**Current Limitations:**
+
+The parser currently handles image info and snapshots for both active and trashed images, but does **not** parse children relationships for trashed images. This means:
+- Parent-child clone chains are correctly built for active images
+- Trashed images appear in the tree but their children may not be linked if the parent snapshot is in trash
+- To fully support this, the capture script needs to include `rbd children` output for trash image snapshots
+
+---
+
+### 4. `rbd_cleanup.py` — Orphan Cleanup
 
 Reads the JSON tree from `rbd_tree_builder.py` and removes orphan images bottom-up, handling clone dependencies along the way.
 
@@ -255,7 +338,9 @@ python3 rbd_cleanup.py tree.json
 
 ## Workflows
 
-### Live Cluster Workflow
+### Workflow 1: Live Cluster (Direct Access)
+
+For environments with direct access to Ceph cluster and `rbd` CLI:
 
 ```bash
 # Step 1: Generate the tree from live cluster
@@ -271,7 +356,9 @@ python3 rbd_cleanup.py --dry-run tree.json
 python3 rbd_cleanup.py tree.json
 ```
 
-### Must-Gather Workflow
+### Workflow 2: Must-Gather Analysis (Offline)
+
+For offline analysis using ODF must-gather data:
 
 ```bash
 # Step 1: Generate the tree from must-gather
@@ -283,6 +370,33 @@ cat tree.json | python3 -m json.tool
 # Step 3: Analyze orphans offline
 # (The tree can be used for analysis; cleanup requires live cluster access)
 ```
+
+### Workflow 3: Manual Data Collection (Must-Gather Incomplete)
+
+When must-gather fails to collect complete RBD data:
+
+```bash
+# Step 1: Capture data manually from live cluster
+# (Run inside ODF toolbox pod or from a system with Ceph access)
+bash capture_rbd_data.sh ocs-storagecluster-cephblockpool rbd_capture
+
+# Step 2: Build the tree from captured data
+python3 rbd_tree_builder_manualData.py rbd_capture/ -o tree.json
+
+# Step 3: Review the tree
+cat tree.json | python3 -m json.tool
+
+# Step 4: (Optional) Dry-run cleanup if you have live cluster access
+python3 rbd_cleanup.py --dry-run tree.json
+
+# Step 5: Execute cleanup
+python3 rbd_cleanup.py tree.json
+```
+
+**Note:** The manual capture workflow is particularly useful when:
+- Must-gather data is incomplete or corrupted
+- You need to capture data at a specific point in time
+- You want to include additional metadata not captured by must-gather
 
 > **Note:** Always regenerate `tree.json` before running cleanup if the pool state may have changed since the last scan. The cleanup script operates on the tree snapshot, not live cluster state (except for existence checks).
 
