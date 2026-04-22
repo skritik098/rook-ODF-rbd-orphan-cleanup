@@ -205,80 +205,161 @@ When the ODF must-gather fails to collect complete RBD data, you can manually ca
 
 #### 3a. `capture_rbd_data.sh` — Manual Data Capture
 
-A bash script that collects RBD pool data directly from a live cluster and produces files compatible with `rbd_tree_builder_manualData.py`.
+A bash script that collects RBD pool data from a live ODF cluster via the Ceph toolbox pod and produces files compatible with `rbd_tree_builder_manualData.py`.
 
 **What It Captures:**
-1. **Trash list** — All images in RBD trash (`rbd trash ls`)
+1. **Trash list** — All images in RBD trash (`rbd trash ls --format json`)
 2. **Image info + snapshots** — For both active and trashed images:
-   - Active images: `rbd info`, `rbd snap ls`
-   - Trashed images: `rbd info --image-id`, `rbd snap ls --image-id`
-3. **PersistentVolume list** — All PVs from Kubernetes API (`kubectl get pv -o json`)
+   - Active images: `rbd info --format json`, `rbd snap ls --all --format json`
+   - Trashed images: `rbd info --image-id --format json`, `rbd snap ls --image-id --all --format json`
+   - **Critical:** Uses `--all` flag to capture ALL snapshots including protected ones used as clone parents
+3. **PersistentVolume list** — All PVs from Kubernetes API (`oc get pv -o json`)
+4. **VolumeSnapshotContent list** — All VolumeSnapshotContents (`oc get volumesnapshotcontent -o json`)
 
 **Usage:**
 
 ```bash
-# Run from a system with Ceph and kubectl access
-bash capture_rbd_data.sh [POOL_NAME] [OUTPUT_DIR]
+# Basic usage with toolbox pod name
+bash capture_rbd_data.sh <TOOLBOX_POD> [POOL] [OUTDIR]
+
+# Examples:
+bash capture_rbd_data.sh rook-ceph-tools-77d6988b97-vvrjd
+bash capture_rbd_data.sh rook-ceph-tools-77d6988b97-vvrjd ocs-storagecluster-cephblockpool rbd_capture
+
+# Auto-detect toolbox pod:
+bash capture_rbd_data.sh $(oc get pod -n openshift-storage -l app=rook-ceph-tools -o jsonpath='{.items[0].metadata.name}')
 
 # Defaults:
-#   POOL_NAME  = ocs-storagecluster-cephblockpool
-#   OUTPUT_DIR = rbd_capture
-
-# Example: Capture specific pool
-bash capture_rbd_data.sh ocs-storagecluster-cephblockpool my_capture
-
-# On ODF clusters, run inside the toolbox pod:
-oc rsh -n openshift-storage $(oc get pod -n openshift-storage -l app=rook-ceph-tools -o name)
-bash capture_rbd_data.sh
+#   POOL   = ocs-storagecluster-cephblockpool
+#   OUTDIR = rbd_capture
 ```
 
 **Output Files:**
 ```
 rbd_capture/
-├── trash_list.json        # JSON array of trashed images
-├── images_and_snaps.txt   # Delimited text: image info + snapshots
-└── pv_list.json           # Kubernetes PV list in JSON
+├── trash_list.json        # JSON: rbd trash ls --format json
+├── all_images.txt         # Marker-delimited: rbd info + snap ls per image
+├── pv_list.json           # JSON: oc get pv -o json
+└── vsc_list.json          # JSON: oc get volumesnapshotcontent -o json
 ```
 
-**Important Note on Trash Images:**
+**File Format Details:**
 
-The current script captures `rbd info` and `rbd snap ls` for trash images using `--image-id`, but does **not** capture children information. To get complete parent-child relationships for trashed images, you need to also run:
+The `all_images.txt` file uses a marker-delimited format for easy parsing:
 
-```bash
-# For each trashed image snapshot, capture children:
-rbd children -p <pool> --image-id <image-id> --snap-id <snap-id>
+```
+### IMAGE <name> SOURCE pool INFO
+{ ... rbd info JSON ... }
+
+### IMAGE <name> SNAPS
+[ ... rbd snap ls JSON ... ]
+
+### IMAGE <name> SOURCE trash TRASH_ID <id> INFO
+{ ... rbd info JSON ... }
+
+### IMAGE <name> SNAPS
+[ ... rbd snap ls JSON ... ]
 ```
 
-This limitation means that clone relationships involving trashed parent images may not be fully represented in the tree. Future versions of the script should include this data.
+**Important Notes:**
+
+- **Snapshot completeness:** The `--all` flag on `rbd snap ls` is critical — without it, protected snapshots used as clone parents may be omitted, breaking the parent-child tree.
+- **Trash images:** Fully supported with `--image-id` flag for both info and snapshot listing.
+- **jq requirement:** The script uses `jq` to parse trash entries. If `jq` is not available, trash images will be skipped with a warning.
 
 #### 3b. `rbd_tree_builder_manualData.py` — Build Tree from Manual Capture
 
-Processes the files created by `capture_rbd_data.sh` and builds the same nested JSON tree structure.
+Processes the files created by `capture_rbd_data.sh` and builds the same nested JSON tree structure with enhanced snapshot reconciliation.
+
+**Key Features:**
+
+1. **Snapshot Reconciliation** — Automatically synthesizes missing snapshots referenced by child images. If a child's `parent` field references a snapshot that doesn't appear in the parent's snapshot list, the tool creates a synthetic entry to ensure the tree can be built correctly.
+
+2. **VolumeSnapshotContent Support** — Parses `vsc_list.json` to enrich snapshot images with Kubernetes VolumeSnapshotContent metadata, including source volume and namespace information.
+
+3. **Robust Parsing** — Handles the marker-delimited format from `capture_rbd_data.sh` with intelligent JSON extraction that tolerates mixed text/JSON content.
 
 **Usage:**
 
 ```bash
-# Basic usage
-python3 rbd_tree_builder_manualData.py rbd_capture/
+# Basic usage (outputs to stdout)
+python3 rbd_tree_builder_manualData.py <capture_dir>
 
 # Specify output file
 python3 rbd_tree_builder_manualData.py rbd_capture/ --output tree.json
+
+# Specify custom pool name (for backfill when rbd info lacks pool field)
+python3 rbd_tree_builder_manualData.py rbd_capture/ --pool ocs-storagecluster-cephblockpool -o tree.json
 ```
 
 **Output Structure:**
 
-Identical to `rbd_tree_builder_mustGather.py` — includes `orphaned_pv` and `volumes` arrays.
+Identical to `rbd_tree_builder_mustGather.py` — includes `orphaned_pv` and `volumes` arrays, plus `snapshotContent` metadata:
+
+```json
+{
+  "orphaned_pv": [...],
+  "volumes": [
+    {
+      "imageId": "646794c7278e",
+      "imageName": "csi-vol-5a2584f6-...",
+      "trash": false,
+      "pool": "ocs-storagecluster-cephblockpool",
+      "namespace": "",
+      "pv": {...},
+      "snapshotContent": {
+        "snapContentName": "snapshot-fb9e356c-...",
+        "imageName": "csi-snap-de3383c4-...",
+        "source": "csi-vol-5a2584f6-...",
+        "volumeOwner": "default"
+      },
+      "snapshots": [...]
+    }
+  ]
+}
+```
 
 **Prerequisites:**
 - Python 3.6+
-- Capture files from `capture_rbd_data.sh`
+- Capture files from `capture_rbd_data.sh`:
+  - `trash_list.json` (required)
+  - `all_images.txt` (required)
+  - `pv_list.json` (required)
+  - `vsc_list.json` (optional, but recommended for complete metadata)
 
-**Current Limitations:**
+**How Snapshot Reconciliation Works:**
 
-The parser currently handles image info and snapshots for both active and trashed images, but does **not** parse children relationships for trashed images. This means:
-- Parent-child clone chains are correctly built for active images
-- Trashed images appear in the tree but their children may not be linked if the parent snapshot is in trash
-- To fully support this, the capture script needs to include `rbd children` output for trash image snapshots
+The tool addresses a critical issue where parent-child relationships can break if snapshots are missing from the parent's snapshot list:
+
+1. **Problem:** A child image's `rbd info` shows `parent: {image: "X", snapshot: "Y"}`, but image X's `rbd snap ls` output doesn't include snapshot Y (e.g., due to missing `--all` flag, trash state, or Ceph version differences).
+
+2. **Solution:** Before building the tree, the tool scans all parent references and synthesizes any missing snapshots with placeholder metadata:
+   ```json
+   {
+     "id": "?",
+     "name": "missing-snap-name",
+     "size": 0,
+     "protected": "true",
+     "timestamp": "(synthesized from child parent reference)"
+   }
+   ```
+
+3. **Result:** Every parent-child link can be resolved, preventing orphaned roots caused by incomplete snapshot data.
+
+**Console Output:**
+
+The tool provides detailed progress information:
+
+```
+[info] Capture dir     : rbd_capture
+[info] Trashed images  : 5
+[info] Images parsed   : 42 total, 38 with snapshots
+[info] RBD-backed PVs  : 35
+[info] SnapshotContents: 12
+[info] Reconciled snaps: 3 missing snapshot(s) synthesized from child parent references
+[info] Result: 8 root volume(s), 2 orphaned PV(s)
+[info] Written to tree.json
+```
 
 ---
 
@@ -376,14 +457,17 @@ cat tree.json | python3 -m json.tool
 When must-gather fails to collect complete RBD data:
 
 ```bash
-# Step 1: Capture data manually from live cluster
-# (Run inside ODF toolbox pod or from a system with Ceph access)
-bash capture_rbd_data.sh ocs-storagecluster-cephblockpool rbd_capture
+# Step 1: Capture data manually from live cluster via toolbox pod
+# First, get the toolbox pod name:
+TOOLBOX=$(oc get pod -n openshift-storage -l app=rook-ceph-tools -o jsonpath='{.items[0].metadata.name}')
+
+# Then capture the data:
+bash capture_rbd_data.sh $TOOLBOX ocs-storagecluster-cephblockpool rbd_capture
 
 # Step 2: Build the tree from captured data
 python3 rbd_tree_builder_manualData.py rbd_capture/ -o tree.json
 
-# Step 3: Review the tree
+# Step 3: Review the tree and check for reconciled snapshots
 cat tree.json | python3 -m json.tool
 
 # Step 4: (Optional) Dry-run cleanup if you have live cluster access
@@ -396,7 +480,9 @@ python3 rbd_cleanup.py tree.json
 **Note:** The manual capture workflow is particularly useful when:
 - Must-gather data is incomplete or corrupted
 - You need to capture data at a specific point in time
-- You want to include additional metadata not captured by must-gather
+- You want to include VolumeSnapshotContent metadata not captured by must-gather
+- You need complete snapshot data including protected snapshots (via `--all` flag)
+- You want to ensure all parent-child relationships are captured correctly
 
 > **Note:** Always regenerate `tree.json` before running cleanup if the pool state may have changed since the last scan. The cleanup script operates on the tree snapshot, not live cluster state (except for existence checks).
 
@@ -405,6 +491,7 @@ python3 rbd_cleanup.py tree.json
 ## Limitations
 
 - **Single pool only** — cross-pool clone chains are not supported.
-- **RADOS OMAP objects** — CSI metadata lookup assumes the standard `csi.volumes.default` / `csi.snaps.default` OMAP objects exist in the default RADOS namespace.
+- **RADOS OMAP objects** — CSI metadata lookup (in `rbd_tree_builder.py`) assumes the standard `csi.volumes.default` / `csi.snaps.default` OMAP objects exist in the default RADOS namespace.
 - **Flatten duration** — `rbd flatten` on large images can take significant time. The command timeout is set to 300 seconds; adjust if needed.
 - **Concurrent modifications** — If other processes are creating/deleting images during a run, results may be inconsistent. Run during a maintenance window if possible.
+- **Snapshot reconciliation** — While `rbd_tree_builder_manualData.py` synthesizes missing snapshots to build a complete tree, the synthesized entries contain placeholder metadata only. The actual snapshot may have been deleted or may exist with different properties.
