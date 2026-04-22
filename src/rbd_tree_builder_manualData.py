@@ -3,14 +3,13 @@
 rbd_tree_builder_live.py
 ========================
 Build Ceph RBD parent-child-snapshot relationship tree from data captured by
-capture_rbd_data.sh on a live cluster.
+capture_rbd_data.sh on a live ODF cluster.
 
 Reads:
-  <capture_dir>/trash_list.json        — rbd trash ls output (JSON array)
-  <capture_dir>/images_and_snaps.txt   — delimited image info + snap blocks
-  <capture_dir>/pv_list.json           — kubectl get pv -o json output
-
-Produces the same nested JSON tree as rbd_tree_builder.py (the must-gather version).
+  <capture_dir>/trash_list.json      — rbd trash ls --format json
+  <capture_dir>/all_images.txt       — marker-delimited rbd info + snap ls
+  <capture_dir>/pv_list.json         — oc get pv -o json
+  <capture_dir>/vsc_list.json        — oc get volumesnapshotcontent -o json
 
 Usage:
     python3 rbd_tree_builder_live.py <capture_dir> [--output output.json]
@@ -25,55 +24,32 @@ from collections import defaultdict
 
 
 # ---------------------------------------------------------------------------
-# Trash list parser  (same JSON format as must-gather)
+# Trash list
 # ---------------------------------------------------------------------------
 
 def parse_trash_list(filepath):
-    """Parse trash_list.json → {image_name: image_id}"""
-    trash_by_name = {}
     if not os.path.exists(filepath):
-        return trash_by_name
-
+        return {}
     with open(filepath, "r", errors="replace") as fh:
         try:
             data = json.load(fh)
         except json.JSONDecodeError:
-            return trash_by_name
-
-    for item in data:
-        name = item.get("name", "")
-        img_id = item.get("id", "")
-        if name:
-            trash_by_name[name] = img_id
-
-    return trash_by_name
+            return {}
+    return {item["name"]: item["id"] for item in data if item.get("name")}
 
 
 # ---------------------------------------------------------------------------
-# images_and_snaps.txt parser  (delimited block format)
+# all_images.txt parser
 # ---------------------------------------------------------------------------
 
-def parse_images_and_snaps(filepath):
-    """
-    Parse the delimited capture file produced by capture_rbd_data.sh.
+MARKER_RE = re.compile(
+    r"^###\s+IMAGE\s+(\S+)\s+"
+    r"(?:SOURCE\s+(\S+)\s+)?(?:TRASH_ID\s+(\S+)\s+)?"
+    r"(INFO|SNAPS)\s*$"
+)
 
-    Block format:
-        ---IMAGE_START---
-        name=<imageName>
-        source=pool|trash
-        [trash_id=<id>]
-        pool=<pool>
-        ---INFO---
-        <rbd info text output>
-        ---SNAPS---
-        <json array of snapshots>
-        ---IMAGE_END---
 
-    Returns:
-        images    : dict  {image_name: {imageId, imageName, pool, namespace,
-                           parent_pool, parent_image, parent_snap, ...}}
-        snapshots : dict  {image_name: [{id, name, size, protected, ...}]}
-    """
+def parse_all_images(filepath):
     images = {}
     snapshots = {}
 
@@ -83,150 +59,92 @@ def parse_images_and_snaps(filepath):
     with open(filepath, "r", errors="replace") as fh:
         content = fh.read()
 
-    # Split into blocks between IMAGE_START and IMAGE_END
-    blocks = re.split(r"---IMAGE_START---", content)
+    lines = content.splitlines()
+    sections = []
 
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
+    current_header = None
+    body_lines = []
 
-        # Strip trailing IMAGE_END
-        end_idx = block.find("---IMAGE_END---")
-        if end_idx != -1:
-            block = block[:end_idx]
+    for line in lines:
+        m = MARKER_RE.match(line)
+        if m:
+            if current_header is not None:
+                sections.append((*current_header, "\n".join(body_lines)))
+                body_lines = []
+            current_header = (m.group(1), m.group(2), m.group(3), m.group(4))
+        else:
+            body_lines.append(line)
 
-        # -- Parse header fields (before ---INFO---) --
-        info_split = block.split("---INFO---", 1)
-        if len(info_split) < 2:
-            continue
+    if current_header is not None:
+        sections.append((*current_header, "\n".join(body_lines)))
 
-        header_text = info_split[0].strip()
-        rest = info_split[1]
+    for image_name, source, trash_id, section_type, body in sections:
+        body = body.strip()
 
-        headers = {}
-        for line in header_text.splitlines():
-            line = line.strip()
-            if "=" in line:
-                key, val = line.split("=", 1)
-                headers[key.strip()] = val.strip()
+        if section_type == "INFO":
+            raw = _safe_json_load(body, {})
 
-        image_name = headers.get("name", "")
-        if not image_name:
-            continue
+            img = {
+                "imageName": raw.get("name", image_name),
+                "imageId": raw.get("id", ""),
+                "pool": raw.get("pool", ""),
+                "namespace": "",
+            }
 
-        pool = headers.get("pool", "")
-        source = headers.get("source", "pool")
-        trash_id = headers.get("trash_id", "")
+            if not img["imageId"] and trash_id:
+                img["imageId"] = trash_id
 
-        # -- Split INFO and SNAPS sections --
-        snaps_split = rest.split("---SNAPS---", 1)
-        info_text = snaps_split[0].strip() if len(snaps_split) >= 1 else ""
-        snaps_text = snaps_split[1].strip() if len(snaps_split) >= 2 else "[]"
+            parent = raw.get("parent")
+            if parent and isinstance(parent, dict):
+                img["parent_pool"] = parent.get("pool", "")
+                img["parent_image"] = parent.get("image", "")
+                img["parent_snap"] = parent.get("snapshot", None)
 
-        # -- Parse image info (same text format as rbd info output) --
-        img_info = _parse_rbd_info_text(info_text, pool, image_name)
+            images[image_name] = img
 
-        # If image came from trash, and we have the trash_id, use it if
-        # rbd info didn't return an id (e.g. info unavailable)
-        if trash_id and not img_info.get("imageId"):
-            img_info["imageId"] = trash_id
-
-        images[image_name] = img_info
-
-        # -- Parse snapshots JSON --
-        snap_list = _parse_snap_json(snaps_text)
-        if snap_list:
-            snapshots[image_name] = snap_list
+        elif section_type == "SNAPS":
+            snap_list = _safe_json_load(body, [])
+            if snap_list:
+                snapshots[image_name] = snap_list
 
     return images, snapshots
 
 
-def _parse_rbd_info_text(text, pool, image_name):
-    """Extract fields from rbd info text output."""
-    info = {
-        "imageName": image_name,
-        "pool": pool,
-        "namespace": "",
-    }
-
-    if "(info unavailable)" in text:
-        info["imageId"] = ""
-        return info
-
-    # imageId
-    m = re.search(r"^\s+id:\s*(\S+)", text, re.MULTILINE)
-    if m:
-        info["imageId"] = m.group(1)
-    else:
-        info["imageId"] = ""
-
-    # snapshot_count
-    m = re.search(r"^\s+snapshot_count:\s*(\d+)", text, re.MULTILINE)
-    if m:
-        info["snapshot_count"] = int(m.group(1))
-    else:
-        info["snapshot_count"] = 0
-
-    # parent  (format: pool/image@snap  or  pool/image)
-    m = re.search(r"^\s+parent:\s*(.+)", text, re.MULTILINE)
-    if m:
-        parent_str = m.group(1).strip()
-        if "@" in parent_str:
-            pool_image_part, snap_part = parent_str.rsplit("@", 1)
-            info["parent_snap"] = snap_part
-        else:
-            pool_image_part = parent_str
-            info["parent_snap"] = None
-
-        if "/" in pool_image_part:
-            info["parent_pool"], info["parent_image"] = pool_image_part.split("/", 1)
-        else:
-            info["parent_pool"] = pool
-            info["parent_image"] = pool_image_part
-
-    return info
-
-
-def _parse_snap_json(text):
-    """Parse JSON snapshot array, tolerating trailing text."""
+def _safe_json_load(text, default):
     text = text.strip()
-    if not text or text == "[]":
-        return []
+    if not text:
+        return default
+    for i, ch in enumerate(text):
+        if ch in ('{', '['):
+            try:
+                return json.loads(text[i:])
+            except json.JSONDecodeError:
+                return _safe_json_balanced(text, i, default)
+    return default
 
-    idx = text.find("[")
-    if idx == -1:
-        return []
 
-    # Find matching closing bracket
+def _safe_json_balanced(text, start, default):
+    open_ch = text[start]
+    close_ch = '}' if open_ch == '{' else ']'
     depth = 0
-    end = idx
-    for i in range(idx, len(text)):
-        if text[i] == "[":
+    for i in range(start, len(text)):
+        if text[i] == open_ch:
             depth += 1
-        elif text[i] == "]":
+        elif text[i] == close_ch:
             depth -= 1
             if depth == 0:
-                end = i + 1
-                break
-    try:
-        return json.loads(text[idx:end])
-    except json.JSONDecodeError:
-        return []
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return default
+    return default
 
 
 # ---------------------------------------------------------------------------
-# PV JSON parser  (kubectl get pv -o json)
+# PV list
 # ---------------------------------------------------------------------------
 
 def parse_pv_json(filepath):
-    """
-    Parse 'kubectl get pv -o json' output.
-
-    Returns:
-        pv_by_image : dict  {imageName: {pvName, imageName, volumeOwner, pool}}
-        all_rbd_pvs : list  [same dicts]
-    """
     pv_by_image = {}
     all_rbd_pvs = []
 
@@ -239,9 +157,7 @@ def parse_pv_json(filepath):
         except json.JSONDecodeError:
             return pv_by_image, all_rbd_pvs
 
-    items = data.get("items", [])
-
-    for pv in items:
+    for pv in data.get("items", []):
         if not isinstance(pv, dict):
             continue
 
@@ -249,14 +165,11 @@ def parse_pv_json(filepath):
         csi = spec.get("csi", {}) or {}
         driver = csi.get("driver", "") or ""
 
-        # Only RBD PVs
         if "rbd" not in driver.lower():
             continue
 
         vol_attrs = csi.get("volumeAttributes", {}) or {}
         image_name = vol_attrs.get("imageName", "")
-        pool = vol_attrs.get("pool", "")
-
         if not image_name:
             continue
 
@@ -268,7 +181,7 @@ def parse_pv_json(filepath):
             "pvName": pv_name,
             "imageName": image_name,
             "volumeOwner": volume_owner,
-            "pool": pool,
+            "pool": vol_attrs.get("pool", ""),
         }
         pv_by_image[image_name] = entry
         all_rbd_pvs.append(entry)
@@ -277,20 +190,163 @@ def parse_pv_json(filepath):
 
 
 # ---------------------------------------------------------------------------
-# Tree builder  (identical logic to rbd_tree_builder.py)
+# VolumeSnapshotContent list
 # ---------------------------------------------------------------------------
 
-def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
-    """
-    Construct the nested JSON tree.
+UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I
+)
 
-    1. Index every child image by its (parent_image, parent_snap) pair.
-    2. Root images = those with no parent field.
-    3. Recursively attach children under each snapshot of each image.
-    4. Unvisited images (broken parent chains) become additional roots.
-    5. PVs whose imageName has no entry in images → orphaned.
+
+def _extract_uuid_from_handle(handle):
+    if not handle:
+        return None
+    matches = UUID_RE.findall(handle)
+    return matches[-1] if matches else None
+
+
+def parse_vsc_json(filepath):
+    vsc_by_image = {}
+
+    if not os.path.exists(filepath):
+        return vsc_by_image
+
+    with open(filepath, "r", errors="replace") as fh:
+        try:
+            data = json.load(fh)
+        except json.JSONDecodeError:
+            return vsc_by_image
+
+    for vsc in data.get("items", []):
+        if not isinstance(vsc, dict):
+            continue
+
+        spec = vsc.get("spec", {}) or {}
+        status = vsc.get("status", {}) or {}
+        driver = spec.get("driver", "") or ""
+
+        if "rbd" not in driver.lower():
+            continue
+
+        vsc_name = (vsc.get("metadata", {}) or {}).get("name", "")
+
+        snap_handle = status.get("snapshotHandle", "") or ""
+        snap_uuid = _extract_uuid_from_handle(snap_handle)
+        if not snap_uuid:
+            continue
+
+        snap_image_name = f"csi-snap-{snap_uuid}"
+
+        source_handle = (spec.get("source", {}) or {}).get("volumeHandle", "") or ""
+        source_uuid = _extract_uuid_from_handle(source_handle)
+        source_image_name = f"csi-vol-{source_uuid}" if source_uuid else ""
+
+        vs_ref = spec.get("volumeSnapshotRef", {}) or {}
+        volume_owner = vs_ref.get("namespace", "")
+
+        vsc_by_image[snap_image_name] = {
+            "snapContentName": vsc_name,
+            "imageName": snap_image_name,
+            "source": source_image_name,
+            "volumeOwner": volume_owner,
+        }
+
+    return vsc_by_image
+
+
+# ---------------------------------------------------------------------------
+# Pool backfill
+# ---------------------------------------------------------------------------
+
+def backfill_pools(images, default_pool):
+    for info in images.values():
+        if not info.get("pool"):
+            info["pool"] = info.get("parent_pool", "") or default_pool
+
+
+# ---------------------------------------------------------------------------
+# Snapshot reconciliation  (THE CRITICAL FIX)
+#
+# Problem: rbd snap ls may return an incomplete list (e.g. without --all,
+# or if the parent is in trash, or due to Ceph version differences).
+# But every CHILD image knows its parent via rbd info "parent" field:
+#   parent: {image: "parent-img", snapshot: "snap-name"}
+#
+# If a child references (parent_image=X, parent_snap=Y) but image X's
+# snapshot list doesn't contain snap Y, the tree builder would fail to
+# attach the child and it becomes an orphaned root.
+#
+# Fix: Before building the tree, scan all parent references from children.
+# If the referenced snapshot is missing from the parent's snap list,
+# synthesize it. This guarantees every parent-child link can be resolved.
+# ---------------------------------------------------------------------------
+
+def reconcile_snapshots(images, snapshots):
     """
-    # (parent_image_name, snap_name) -> [child_image_name, ...]
+    Ensure every snapshot referenced by a child's parent field exists in
+    the parent's snapshot list. If missing, create a synthetic entry.
+    """
+    synthesized = 0
+
+    for img_name, info in images.items():
+        parent_image = info.get("parent_image")
+        parent_snap = info.get("parent_snap")
+
+        if not parent_image or not parent_snap:
+            continue
+
+        # Check if the parent image even exists in our data
+        if parent_image not in images:
+            continue
+
+        # Get parent's current snapshot list
+        parent_snaps = snapshots.get(parent_image, [])
+        snap_names = {s.get("name", "") for s in parent_snaps}
+
+        # If the referenced snapshot is missing, synthesize it
+        if parent_snap not in snap_names:
+            if parent_image not in snapshots:
+                snapshots[parent_image] = []
+
+            snapshots[parent_image].append({
+                "id": "?",
+                "name": parent_snap,
+                "size": 0,
+                "protected": "true",
+                "timestamp": "(synthesized from child parent reference)",
+            })
+            synthesized += 1
+
+    return synthesized
+
+
+# ---------------------------------------------------------------------------
+# Tree builder
+# ---------------------------------------------------------------------------
+
+def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs,
+               vsc_by_image):
+    """
+    Build nested parent → snapshot → child tree.
+
+    1. Reconcile snapshots: ensure all parent-referenced snaps exist.
+    2. Index children by (parent_image, parent_snap).
+    3. Roots = images with no parent.
+    4. Recurse: attach children under each snapshot node.
+    5. Unvisited images → extra roots (broken chains).
+    6. PVs with no image → orphaned.
+    """
+
+    # --- CRITICAL: reconcile before building ---
+    synth_count = reconcile_snapshots(images, snapshots)
+    if synth_count > 0:
+        print(
+            f"[info] Reconciled snaps: {synth_count} missing snapshot(s) "
+            f"synthesized from child parent references",
+            file=sys.stderr,
+        )
+
+    # --- Index children by parent ---
     children_of_snap = defaultdict(list)
 
     for img_name, info in images.items():
@@ -303,7 +359,7 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
 
     def _build_node(img_name):
         if img_name in visited:
-            return None  # prevent cycles
+            return None
         visited.add(img_name)
 
         info = images.get(img_name, {})
@@ -315,10 +371,10 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
             "namespace": info.get("namespace", ""),
             "pool": info.get("pool", ""),
             "pv": None,
+            "snapshotContent": None,
             "snapshots": [],
         }
 
-        # Attach PV reference
         if img_name in pv_by_image:
             pv = pv_by_image[img_name]
             node["pv"] = {
@@ -326,6 +382,9 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
                 "imageName": pv["imageName"],
                 "volumeOwner": pv["volumeOwner"],
             }
+
+        if img_name in vsc_by_image:
+            node["snapshotContent"] = vsc_by_image[img_name]
 
         # Attach snapshots and recurse into children
         img_snaps = snapshots.get(img_name, [])
@@ -339,7 +398,6 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
                 "children": [],
             }
 
-            # Children cloned from this exact snapshot
             for child_name in children_of_snap.get((img_name, snap_name), []):
                 child = _build_node(child_name)
                 if child:
@@ -347,30 +405,27 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
 
             node["snapshots"].append(snap_node)
 
-        # Children whose parent_snap is None (parent line without @snap)
+        # Children with unknown parent snapshot (parent_snap is None)
         for child_name in children_of_snap.get((img_name, None), []):
-            if len(img_snaps) == 1:
-                existing = node["snapshots"][0] if node["snapshots"] else None
-                if existing:
-                    child = _build_node(child_name)
-                    if child:
-                        existing["children"].append(child)
-                    continue
+            if len(img_snaps) == 1 and node["snapshots"]:
+                child = _build_node(child_name)
+                if child:
+                    node["snapshots"][0]["children"].append(child)
+                continue
 
             child = _build_node(child_name)
             if child:
-                synthetic_snap = {
+                node["snapshots"].append({
                     "snapId": "unknown",
                     "snapName": "[parent-snap-unknown]",
                     "children": [child],
-                }
-                node["snapshots"].append(synthetic_snap)
+                })
 
         return node
 
-    # --- Identify roots (images with no parent) ---
+    # --- Roots: images with no parent ---
     root_names = [
-        name for name, info in images.items() if "parent_image" not in info
+        n for n, info in images.items() if "parent_image" not in info
     ]
 
     volumes = []
@@ -379,7 +434,7 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
         if node:
             volumes.append(node)
 
-    # --- Catch any unvisited images (broken parent chains) ---
+    # --- Unvisited (broken parent chains) become extra roots ---
     for name in sorted(images.keys()):
         if name not in visited:
             node = _build_node(name)
@@ -409,15 +464,16 @@ def build_tree(images, snapshots, trash_by_name, pv_by_image, all_rbd_pvs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Build Ceph RBD parent-child-snapshot tree from live-capture data "
-            "(produced by capture_rbd_data.sh)."
-        ),
+        description="Build Ceph RBD parent-child-snapshot tree from live-capture data.",
     )
     parser.add_argument(
         "capture_dir",
-        help="Path to capture directory containing trash_list.json, "
-             "images_and_snaps.txt, and pv_list.json.",
+        help="Path to capture directory produced by capture_rbd_data.sh.",
+    )
+    parser.add_argument(
+        "--pool", "-p",
+        default="ocs-storagecluster-cephblockpool",
+        help="Default pool name (fallback when rbd info lacks pool field).",
     )
     parser.add_argument(
         "--output", "-o",
@@ -434,60 +490,61 @@ def main():
 
     capture_dir = args.capture_dir
 
-    # --- Validate input files ---
     trash_file = os.path.join(capture_dir, "trash_list.json")
-    info_file = os.path.join(capture_dir, "images_and_snaps.txt")
+    images_file = os.path.join(capture_dir, "all_images.txt")
     pv_file = os.path.join(capture_dir, "pv_list.json")
+    vsc_file = os.path.join(capture_dir, "vsc_list.json")
 
-    missing = []
-    for f in [trash_file, info_file, pv_file]:
-        if not os.path.exists(f):
-            missing.append(os.path.basename(f))
-
-    if missing:
+    if not os.path.exists(images_file):
         print(
-            f"ERROR: Missing file(s) in '{capture_dir}': {', '.join(missing)}\n"
-            f"       Run capture_rbd_data.sh first to generate these files.",
+            f"ERROR: '{images_file}' not found.\n"
+            f"       Run capture_rbd_data.sh first.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     print(f"[info] Capture dir     : {capture_dir}", file=sys.stderr)
 
-    # --- Parse trash list ---
     trash_by_name = parse_trash_list(trash_file)
     print(f"[info] Trashed images  : {len(trash_by_name)}", file=sys.stderr)
 
-    # --- Parse image + snap info ---
-    images, snaps = parse_images_and_snaps(info_file)
+    images, snaps = parse_all_images(images_file)
     print(
         f"[info] Images parsed   : {len(images)} total, "
         f"{len(snaps)} with snapshots",
         file=sys.stderr,
     )
 
-    # --- Parse PV list ---
+    backfill_pools(images, args.pool)
+
     pv_by_image, all_rbd_pvs = parse_pv_json(pv_file)
     print(f"[info] RBD-backed PVs  : {len(all_rbd_pvs)}", file=sys.stderr)
 
-    # --- Build the tree ---
-    result = build_tree(images, snaps, trash_by_name, pv_by_image, all_rbd_pvs)
+    vsc_by_image = parse_vsc_json(vsc_file)
+    if os.path.exists(vsc_file):
+        print(f"[info] SnapshotContents: {len(vsc_by_image)}", file=sys.stderr)
+    else:
+        print("[info] SnapshotContents: (vsc_list.json not found, skipping)",
+              file=sys.stderr)
+
+    result = build_tree(
+        images, snaps, trash_by_name, pv_by_image, all_rbd_pvs, vsc_by_image
+    )
 
     total_orphaned = len(result["orphaned_pv"])
     total_roots = len(result["volumes"])
     print(
-        f"[info] Result: {total_roots} root volume(s), {total_orphaned} orphaned PV(s)",
+        f"[info] Result: {total_roots} root volume(s), "
+        f"{total_orphaned} orphaned PV(s)",
         file=sys.stderr,
     )
 
-    # --- Output ---
     indent = 2 if args.pretty else None
     output_json = json.dumps(result, indent=indent)
 
     if args.output:
         with open(args.output, "w") as fh:
-            fh.write(output_json)
-            fh.write("\n")
+            fh.write(output_json + "\n")
         print(f"[info] Written to {args.output}", file=sys.stderr)
     else:
         print(output_json)
