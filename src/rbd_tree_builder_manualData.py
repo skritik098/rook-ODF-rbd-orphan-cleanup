@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rbd_tree_builder_live.py
+rbd_tree_builder_manualData.py
 ========================
 Build Ceph RBD parent-child-snapshot relationship tree from data captured by
 capture_rbd_data.sh on a live ODF cluster.
@@ -12,7 +12,7 @@ Reads:
   <capture_dir>/vsc_list.json        — oc get volumesnapshotcontent -o json
 
 Usage:
-    python3 rbd_tree_builder_live.py <capture_dir> [--output output.json]
+    python3 rbd_tree_builder_manualData.py <capture_dir> [--output output.json]
 """
 
 import os
