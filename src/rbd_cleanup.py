@@ -154,8 +154,37 @@ def get_live_snap_ids(pool, namespace, image_id, dry_run):
         return None
 
 
-def image_exists(pool, namespace, image_id):
-    """Check if an image still exists on the cluster (regular or trash)."""
+def image_exists(pool, namespace, image_id, is_trash=False):
+    """
+    Check if an image still exists on the cluster.
+
+    For trash images we cannot rely on `rbd info --image-id` — on many Ceph
+    versions that command only resolves IDs against non-trashed images and
+    returns non-zero for trashed ones, which would make the caller think the
+    image was auto-purged when it is in fact still sitting in the trash.
+    Query the trash list directly in that case.
+    """
+    if is_trash:
+        cmd = (
+            ["rbd", "trash", "ls", "-p", pool]
+            + ns_args(namespace)
+            + ["--format", "json"]
+        )
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return True  # assume exists on timeout — safer than skipping
+        if result.returncode != 0:
+            # Cannot determine — err on the side of attempting removal
+            # so we don't silently leave images behind.
+            return True
+        try:
+            entries = json.loads(result.stdout.strip() or "[]")
+            return any(str(e.get("id", "")) == image_id for e in entries)
+        except (json.JSONDecodeError, TypeError):
+            return True
+
+    # Regular (non-trash) image
     cmd = (
         ["rbd", "info", "-p", pool]
         + ns_args(namespace)
@@ -181,7 +210,9 @@ def delete_image_snapshots_and_self(node, pool, dry_run):
     is_trash = node.get("trash", False)
 
     # ── Check if the image itself still exists ──
-    if not dry_run and not image_exists(pool, ns, image_id):
+    # Note: pass is_trash so trash images are looked up via `rbd trash ls`
+    # rather than `rbd info --image-id`, which doesn't reliably find them.
+    if not dry_run and not image_exists(pool, ns, image_id, is_trash=is_trash):
         log(f"  Image '{image_name}' (id={image_id}) already auto-purged, nothing to do.")
         return True
 
@@ -198,27 +229,29 @@ def delete_image_snapshots_and_self(node, pool, dry_run):
             log(f"  Snapshot '{snap_name}' (snap-id: {snap_id}) already removed, skipping.")
             continue
 
-        # Unprotect (best-effort, uses --snap <name> not --snap-id)
+        # Unprotect (best-effort). When using --image-id, identify the snap
+        # by --snap-id rather than --snap <name>: name-based lookup is not
+        # reliable in this mode (and fails outright for trash images).
         ok, err = run_cmd(
             ["rbd", "snap", "unprotect", "-p", pool]
             + ns_args(ns)
-            + ["--image-id", image_id, "--snap", snap_name],
+            + ["--image-id", image_id, "--snap-id", snap_id],
             dry_run=dry_run,
         )
         if not ok:
             lower = err.lower()
             if "not protected" not in lower and "no such" not in lower:
-                warn(f"  Unprotect snap '{snap_name}' failed: {err}")
+                warn(f"  Unprotect snap '{snap_name}' (id={snap_id}) failed: {err}")
 
-        # Remove snapshot
+        # Remove snapshot — same rationale: --snap-id with --image-id.
         ok, err = run_cmd(
             ["rbd", "snap", "rm", "-p", pool]
             + ns_args(ns)
-            + ["--image-id", image_id, "--snap", snap_name],
+            + ["--image-id", image_id, "--snap-id", snap_id],
             dry_run=dry_run,
         )
         if not ok:
-            error(f"  Failed to remove snapshot '{snap_name}': {err}")
+            error(f"  Failed to remove snapshot '{snap_name}' (id={snap_id}): {err}")
             return False
 
     # ── Image ──
